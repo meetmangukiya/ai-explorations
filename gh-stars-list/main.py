@@ -3,6 +3,8 @@ import json
 import ollama
 from typing import List, Dict
 import time
+from pydantic import BaseModel
+from typing import List, Dict
 
 class GitHubStarsOrganizer:
     def __init__(self, username: str, token: str):
@@ -101,57 +103,80 @@ class GitHubStarsOrganizer:
         response = requests.put(url, headers=self.headers, json=data)
         return response.status_code == 204
 
+# Define the schema for AI response using Pydantic
+class ListSuggestion(BaseModel):
+    lists: List[str]
+    confidence: float
+    reasoning: str | None = None
+
 def categorize_with_ai(repo: Dict, existing_lists: List[Dict]) -> List[str]:
     # Prepare the context for AI
     existing_list_names = [lst['name'] for lst in existing_lists]
     existing_lists_str = ", ".join(existing_list_names) if existing_list_names else "No existing lists"
 
+    # Define the format schema for structured output
+    format_schema = {
+        "type": "object",
+        "properties": {
+            "lists": {
+                "type": "array",
+                "items": {
+                    "type": "string"
+                },
+                "maxItems": 3
+            },
+            "confidence": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+            },
+            "reasoning": {
+                "type": "string"
+            }
+        },
+        "required": ["lists", "confidence"]
+    }
+
+    # Create the prompt
     prompt = f"""
-    Analyze this GitHub repository:
-    Name: {repo['name']}
-    Description: {repo['description']}
-    Language: {repo['language']}
-    Topics: {', '.join(repo['topics'])}
+    Analyze this GitHub repository and suggest appropriate lists to categorize it:
+
+    Repository Details:
+    - Name: {repo['name']}
+    - Description: {repo['description']}
+    - Language: {repo['language']}
+    - Topics: {', '.join(repo['topics'])}
 
     Existing lists: {existing_lists_str}
 
-    INSTRUCTIONS:
-    - Categorize this repository into up to 3 appropriate lists
-    - Can use existing lists or suggest new ones
-    - Return XML format only
-    - No additional text or explanation
-
-    OUTPUT FORMAT:
-    <lists>
-      <list>list_name1</list>
-      <list>list_name2</list>
-      <list>list_name3</list>
-    </lists>
+    Return up to 3 most appropriate list names (can be existing or new ones).
     """
 
-    # Call Ollama
-    response = ollama.chat(model="llama3.2:3b", messages=[
-        {
-            "role": "user",
-            "content": prompt
-        }
-    ])
-
-    # Parse XML response
-    import xml.etree.ElementTree as ET
-    from io import StringIO
-
     try:
-        xml_str = response['message']['content']
-        # Extract XML content if there's surrounding text
-        if '<lists>' in xml_str:
-            xml_str = xml_str[xml_str.find('<lists>'):xml_str.find('</lists>') + 8]
+        # Call Ollama with structured output
+        response = ollama.chat(
+            model="llama3.2:3b",
+            messages=[{
+                "role": "user",
+                "content": prompt
+            }],
+            format=format_schema,
+            options={"temperature": 0}  # More deterministic output
+        )
 
-        root = ET.fromstring(xml_str)
-        suggested_lists = [list_elem.text.strip() for list_elem in root.findall('list')]
-        return suggested_lists[:3]  # Limit to 3 lists max
-    except ET.ParseError:
-        print(f"Failed to parse XML response: {response['message']['content']}")
+        # Parse the response using Pydantic
+        suggestion = ListSuggestion.model_validate_json(response.message.content)
+
+        # Log the results
+        print(f"Suggested lists: {suggestion.lists}")
+        print(f"Confidence: {suggestion.confidence}")
+        if suggestion.reasoning:
+            print(f"Reasoning: {suggestion.reasoning}")
+
+        return suggestion.lists
+
+    except Exception as e:
+        print(f"Error during AI categorization: {str(e)}")
         return []
 
 def main():
@@ -164,12 +189,12 @@ def main():
     parser.add_argument('--token', required=False, help='GitHub personal access token')
     args = parser.parse_args()
 
+    if not args.username or not args.token:
+        parser.error("--username and --token arguments are required")
+
+    organizer = GitHubStarsOrganizer(args.username, args.token)
+
     if args.action == 'get_starred_repos':
-        if not args.username or not args.token:
-            parser.error("get_starred_repos action requires --username and --token arguments")
-
-        organizer = GitHubStarsOrganizer(args.username, args.token)
-
         # Get and store starred repos
         print("Fetching starred repositories...")
         starred_repos = organizer.get_starred_repos()
